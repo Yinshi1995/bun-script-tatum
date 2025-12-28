@@ -21,7 +21,7 @@ const TATUM_API_KEY = mustGetEnv("TATUM_API_KEY");
 const WEBHOOK_URL = mustGetEnv("WEBHOOK_URL");
 const MNEMONIC_ENC_KEY = mustGetEnv("MNEMONIC_ENC_KEY");
 
-const NET_TYPE = "mainnet"; // or "testnet"
+const NET_TYPE = "mainnet";
 const NETWORK_CODE = process.env.NETWORK_CODE ?? "bitcoin";
 const TATUM_BASE_URL = process.env.TATUM_BASE_URL ?? "https://api.tatum.io";
 
