@@ -1,0 +1,390 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ===== ENUMS =====
+
+enum ROLE {
+  PARTNER
+  ADMIN
+}
+
+enum TransactionType {
+  FLOAT
+  FIXED
+}
+
+enum TransactionStatus {
+  WAITING_FOR_DEPOSIT
+  DEPOSITED
+  IN_PROGRESS
+  FINISHED
+  REJECTED
+  REFUNDED
+}
+
+// Протокол/тип API именно со стороны Tatum gateway
+enum TatumProtocol {
+  JSON_RPC
+  REST
+  GRPC
+
+  INDEXER
+  BEACON
+  ELECTRS
+
+  ROSSETTA
+  SUBSTRATE
+
+  TENDERMINT_RPC
+  TENDERMINT_REST
+
+  HORIZON
+  SOROBAN
+
+  TON_V2_HTTP
+  TON_V3_INDEXER
+}
+
+// Зачем нам endpoint (минимально)
+enum TatumEndpointRole {
+  DEPOSIT
+  INDEXER
+  OTHER
+}
+
+// Тип Tatum Notifications (минимум, можно расширять)
+enum TatumSubscriptionType {
+  ADDRESS_EVENT
+  ADDRESS_TRANSACTION
+  CONTRACT_ADDRESS_LOG_EVENT
+  CONTRACT_ADDRESS_TX_EVENT
+  INCOMING_NATIVE_TX
+  OUTGOING_NATIVE_TX
+  INCOMING_TOKEN_TX
+  OUTGOING_TOKEN_TX
+}
+
+// ===== USERS (AUTH) =====
+
+model User {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  email          String? @unique
+  username       String? @unique
+  hashedPassword String?
+
+  role ROLE @default(PARTNER)
+
+  apiKey              String? @unique
+  partnerTxCount      Int     @default(0)
+  unwithdrawnEarnings Decimal @default(0)
+
+  isActive Boolean @default(true)
+
+  tokens   Token[]
+  sessions Session[]
+
+  partnerTransactions Transaction[] @relation("TransactionPartnerUser")
+
+  @@index([role])
+  @@index([email])
+  @@index([username])
+}
+
+model Session {
+  id                 Int       @id @default(autoincrement())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  expiresAt          DateTime?
+  handle             String    @unique
+  hashedSessionToken String?
+  antiCSRFToken      String?
+  publicData         String?
+  privateData        String?
+
+  user   User? @relation(fields: [userId], references: [id])
+  userId Int?
+}
+
+model Token {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  hashedToken String
+  type        String
+  expiresAt   DateTime
+  sentTo      String
+
+  user   User @relation(fields: [userId], references: [id])
+  userId Int
+
+  @@unique([hashedToken, type])
+}
+
+// ===== COINS =====
+
+model Coin {
+  code String @id // BTC, ETH, USDT...
+
+  name     String
+  iconUrl  String
+  isActive Boolean @default(true)
+
+  coinNetworks CoinNetwork[]
+
+  @@index([isActive])
+}
+
+// ===== NETWORKS =====
+
+model Network {
+  id   Int    @id @default(autoincrement())
+  code String @unique // "bitcoin", "ethereum", "tron", ...
+  name String
+
+  requiresMemo Boolean @default(false)
+
+  // Legacy/внутренний идентификатор (можно оставить, если уже используешь)
+  tatumLedger String
+
+  // ✅ Для /v4/subscription -> attr.chain
+  // Рекомендуемый формат: "ethereum-mainnet", "bitcoin-mainnet", "tron-mainnet", ...
+  tatumChain String?
+
+  // ✅ Для v3 REST адресов: /v3/{tatumV3Path}/...
+  // Примеры: ethereum, bitcoin, tron, solana, litecoin, dogecoin, bcash
+  tatumV3Path String?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  coinNetworks       CoinNetwork[]
+  tatumEndpoints     TatumEndpoint[]
+  tatumWallet        TatumWallet?
+  tatumSubscriptions TatumSubscription[]
+
+  @@index([isActive])
+  @@index([tatumLedger])
+  @@index([tatumChain])
+  @@index([tatumV3Path])
+}
+
+// ===== MASTER WALLET PER NETWORK (для генерации депозитных адресов) =====
+// Для HD-цепей храним xpub+mnemonicEncrypted.
+// Для Solana/Algorand (single address per mnemonic) всё равно удобно хранить mnemonicEncrypted/address.
+model TatumWallet {
+  id        Int     @id @default(autoincrement())
+  networkId Int     @unique
+  network   Network @relation(fields: [networkId], references: [id], onDelete: Cascade)
+
+  // HD (BTC/ETH/TRON/LTC/DOGE/BCH etc)
+  xpub String?
+
+  // Некоторые цепи (Solana/Algorand) возвращают mnemonic+address (не HD в вашем понимании).
+  address String?
+
+  // Шифруй на уровне приложения (KMS/ENV key). Prisma этого не делает.
+  mnemonicEncrypted String?
+
+  // Для HD: следующий индекс адреса для деривации
+  nextDerivationIndex Int @default(0)
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ===== TATUM ENDPOINTS (GATEWAY) =====
+// Это RPC Gateway URL, не нужно для /v3 wallet и /v4 subscription напрямую,
+// но можно оставить для RPC/healthcheck/индексера.
+model TatumEndpoint {
+  id Int @id @default(autoincrement())
+
+  networkId Int
+  network   Network @relation(fields: [networkId], references: [id], onDelete: Cascade)
+
+  role     TatumEndpointRole
+  protocol TatumProtocol
+
+  name String?
+  url  String
+
+  isActive  Boolean @default(true)
+  isDefault Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([networkId, protocol, name])
+  @@index([networkId, role, isActive])
+  @@index([networkId, protocol, isActive])
+  @@index([isDefault])
+}
+
+// ===== COIN <-> NETWORK =====
+
+model CoinNetwork {
+  id Int @id @default(autoincrement())
+
+  coinCode String
+  coin     Coin   @relation(fields: [coinCode], references: [code], onDelete: Restrict)
+
+  networkId Int
+  network   Network @relation(fields: [networkId], references: [id], onDelete: Restrict)
+
+  depositEnabled  Boolean @default(true)
+  withdrawEnabled Boolean @default(true)
+
+  isDefault Boolean @default(false)
+
+  requiresMemoOverride Boolean?
+
+  tokenContractAddress String?
+  decimals             Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([coinCode, networkId])
+  @@index([coinCode])
+  @@index([networkId])
+  @@index([isDefault])
+}
+
+// ===== SETTINGS =====
+
+model Setting {
+  id String @id @default("global")
+
+  feeFloat Decimal @default(0)
+  feeFixed Decimal @default(0)
+  minFee   Decimal @default(0)
+
+  minDeposit Decimal @default(0)
+  maxDeposit Decimal @default(0)
+
+  siteOnline Boolean @default(true)
+
+  // базовый URL для вебхуков (опционально, если хочешь конфигурировать из админки)
+  webhookBaseUrl String?
+
+  updatedAt DateTime @updatedAt
+}
+
+// ===== TRANSACTIONS =====
+
+model Transaction {
+  id String @id @default(uuid())
+
+  type   TransactionType?
+  status TransactionStatus
+
+  depositCoinNetworkId Int?
+  payoutCoinNetworkId  Int
+
+  depositAmount    Decimal
+  depositAmountBtc Decimal
+  payoutAmount     Decimal
+  payoutAmountBtc  Decimal
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ourDepositAddress      String
+  ourDepositAddressExtra String?
+
+  recipientAddress      String
+  recipientAddressExtra String?
+
+  refundAddress String?
+
+  isPartner    Boolean
+  partnerEmail String?
+
+  partnerUserId Int?
+  partnerUser   User? @relation("TransactionPartnerUser", fields: [partnerUserId], references: [id])
+
+  finishedAt      DateTime?
+  profitBtc       Decimal?
+  profitRate      Decimal?
+  partnerShare    Decimal?
+  depositTxHash   String?
+  payoutTxHash    String?
+  finalSentAmount Decimal?
+
+  // ===== TATUM интеграция для депозитов =====
+  // Снапшотим, чтобы изменения в Network не ломали исторические данные
+  tatumChain  String?
+  tatumV3Path String?
+
+  // Для HD: индекс деривации для адреса депозита
+  depositDerivationIndex Int?
+
+  // URL вебхука, куда Tatum будет постить события (удобно для аудита)
+  webhookUrl String?
+
+  // id подписки /v4/subscription
+  tatumSubscriptionId String?            @unique
+  tatumSubscription   TatumSubscription?
+
+  @@index([status, createdAt])
+  @@index([isPartner, createdAt])
+  @@index([partnerUserId, createdAt])
+  @@index([partnerEmail])
+  @@index([depositCoinNetworkId, payoutCoinNetworkId])
+  @@index([finishedAt])
+  @@index([depositTxHash])
+  @@index([payoutTxHash])
+  @@index([tatumChain])
+}
+
+// ===== SUBSCRIPTIONS =====
+// Храним подписки Notifications (V4). Можно расширить под разные типы.
+model TatumSubscription {
+  // Это именно id, который вернул Tatum (строка)
+  id String @id
+
+  type    TatumSubscriptionType
+  chain   String
+  address String
+  url     String
+
+  networkId Int?
+  network   Network? @relation(fields: [networkId], references: [id], onDelete: SetNull)
+
+  transactionId String?      @unique
+  transaction   Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([chain])
+  @@index([address])
+  @@index([isActive])
+}
+
+// Частичные уникальные индексы (raw SQL), чтобы:
+// 1) На сеть был максимум 1 дефолтный endpoint на роль
+// CREATE UNIQUE INDEX "TatumEndpoint_one_default_per_role"
+// ON "TatumEndpoint" ("networkId","role")
+// WHERE "isDefault" = true;
+
+// (оставляю твой)
+// CREATE UNIQUE INDEX "CoinNetwork_one_default_per_coin"
+// ON "CoinNetwork" ("coinCode")
+// WHERE "isDefault" = true;
