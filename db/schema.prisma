@@ -14,9 +14,11 @@ enum ROLE {
   ADMIN
 }
 
-enum TransactionType {
-  FLOAT
-  FIXED
+enum DepositAddressStrategy {
+  HD_XPUB
+  WALLET_SINGLE_ADDR
+  WALLET_PER_DEPOSIT
+  SHARED_ADDR_WITH_TAG
 }
 
 enum TransactionStatus {
@@ -28,60 +30,7 @@ enum TransactionStatus {
   REFUNDED
 }
 
-enum V3WalletKind {
-  WALLET   // /v3/{path}/wallet
-  ACCOUNT  // /v3/{path}/account
-}
-
-// Протокол/тип API именно со стороны Tatum gateway
-enum TatumProtocol {
-  JSON_RPC
-  REST
-  GRPC
-
-  INDEXER
-  BEACON
-  ELECTRS
-
-  ROSSETTA
-  SUBSTRATE
-
-  TENDERMINT_RPC
-  TENDERMINT_REST
-
-  HORIZON
-  SOROBAN
-
-  TON_V2_HTTP
-  TON_V3_INDEXER
-}
-
-// Зачем нам endpoint (минимально)
-enum TatumEndpointRole {
-  // Используется для операций, где нужен “node-like” доступ для депозитных адресов/активностей
-  DEPOSIT
-  // Индексер/сканер (если где-то нужен отдельно)
-  INDEXER
-  // Остальное (beacon, solidity, etc) — если не хочешь плодить роли
-  OTHER
-}
-
-// ✅ Стратегия выдачи депозитного адреса на сети
-enum DepositAddressStrategy {
-  // address = f(xpub, index) — BTC/LTC/ETH/TRON и т.п.
-  HD_XPUB
-
-  // один адрес на master wallet (сознательно один и тот же)
-  WALLET_SINGLE_ADDR
-
-  // новый wallet (адрес) на каждый депозит (Algorand/Solana-стиль)
-  WALLET_PER_DEPOSIT
-
-  // один master address + уникальный memo/tag/paymentId на депозит
-  SHARED_ADDR_WITH_TAG
-}
-
-// ===== USERS (AUTH) =====
+// ===== AUTH =====
 
 model User {
   id        Int      @id @default(autoincrement())
@@ -94,20 +43,16 @@ model User {
 
   role ROLE @default(PARTNER)
 
-  apiKey              String? @unique
-  partnerTxCount      Int     @default(0)
-  unwithdrawnEarnings Decimal @default(0)
-
+  // API access (server-to-server)
+  apiKey   String? @unique
   isActive Boolean @default(true)
 
-  tokens   Token[]
   sessions Session[]
+  tokens   Token[]
 
-  partnerTransactions Transaction[] @relation("TransactionPartnerUser")
-
-  @@index([role])
   @@index([email])
   @@index([username])
+  @@index([isActive])
 }
 
 model Session {
@@ -121,8 +66,11 @@ model Session {
   publicData         String?
   privateData        String?
 
-  user   User? @relation(fields: [userId], references: [id])
+  user   User? @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId Int?
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model Token {
@@ -134,50 +82,29 @@ model Token {
   expiresAt   DateTime
   sentTo      String
 
-  user   User @relation(fields: [userId], references: [id])
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId Int
 
   @@unique([hashedToken, type])
-}
-
-// ===== COINS =====
-
-model Coin {
-  code String @id // BTC, ETH, USDT...
-
-  name     String
-  iconUrl  String
-  isActive Boolean @default(true)
-
-  coinNetworks CoinNetwork[]
-
-  @@index([isActive])
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 // ===== NETWORKS =====
 
 model Network {
   id   Int    @id @default(autoincrement())
-  code String @unique // "bitcoin", "ethereum", "tron", ...
+  code String @unique   // "bitcoin", "ethereum", "tron", ...
+
   name String
 
-  // нужен ли memo/tag/paymentId на входящем депозите (XRP/XLM и т.п.)
+  // XRP/XLM/etc
   requiresMemo Boolean @default(false)
 
+  // Used directly by the script
   tatumLedger String
-
   tatumV3Path String?
-
-  tatumChain String?
-
-  v3WalletKind V3WalletKind @default(WALLET)
-
-  v3SupportsXpubDerivation Boolean @default(true)
-
-  v3BalancePathTemplate String? // например:
-  // "/v3/ethereum/account/balance/{address}"
-  // "/v3/{path}/address/balance/{address}"
-  // "/v3/algorand/account/{address}"
+  tatumChain  String?
 
   depositAddressStrategy DepositAddressStrategy @default(HD_XPUB)
 
@@ -186,9 +113,10 @@ model Network {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  coinNetworks   CoinNetwork[]
-  tatumEndpoints TatumEndpoint[]
-  tatumWallet    TatumWallet?
+  tatumWallet TatumWallet?
+
+  depositTransactions Transaction[] @relation("TxDepositNetwork")
+  payoutTransactions  Transaction[] @relation("TxPayoutNetwork")
 
   @@index([isActive])
   @@index([tatumLedger])
@@ -197,28 +125,26 @@ model Network {
   @@index([depositAddressStrategy])
 }
 
-// ===== MASTER WALLET PER NETWORK =====
-// HD_XPUB: xpub+mnemonicEncrypted + nextDerivationIndex
-// WALLET_SINGLE_ADDR / SHARED_ADDR_WITH_TAG: address+mnemonicEncrypted + nextTag
-// WALLET_PER_DEPOSIT: мастер-кошелёк может быть пустым или хранить “root mnemonic”, но чаще не нужен
+// ===== MASTER WALLET (CORE FOR SCRIPT) =====
+
 model TatumWallet {
   id        Int     @id @default(autoincrement())
   networkId Int     @unique
   network   Network @relation(fields: [networkId], references: [id], onDelete: Cascade)
 
-  // HD (BTC/ETH/TRON/LTC/...)
+  // HD wallets
   xpub String?
 
-  // master address (single/shared strategies)
+  // single/shared address
   address String?
 
-  // mnemonic/secret key зашифрованный на уровне приложения
+  // encrypted mnemonic / secret
   mnemonicEncrypted String?
 
-  // HD: следующий индекс адреса
+  // HD allocation
   nextDerivationIndex Int @default(0)
 
-  // SHARED_ADDR_WITH_TAG: следующий tag/memo/paymentId
+  // SHARED_ADDR_WITH_TAG allocation
   nextDepositTag Int @default(1)
 
   isActive Boolean @default(true)
@@ -229,140 +155,48 @@ model TatumWallet {
   @@index([isActive])
 }
 
-// ===== TATUM ENDPOINTS =====
-
-model TatumEndpoint {
-  id Int @id @default(autoincrement())
-
-  networkId Int
-  network   Network @relation(fields: [networkId], references: [id], onDelete: Cascade)
-
-  role     TatumEndpointRole
-  protocol TatumProtocol
-
-  // например: "C-Chain", "P-Chain", "X-Chain", "Algod", "Indexer", ...
-  name String?
-
-  url String
-
-  isActive  Boolean @default(true)
-  isDefault Boolean @default(false)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Не плодим одинаковые (protocol+name) в рамках одной сети
-  @@unique([networkId, protocol, name])
-  @@index([networkId, role, isActive])
-  @@index([networkId, protocol, isActive])
-  @@index([isDefault])
-}
-
-// ===== COIN <-> NETWORK =====
-
-model CoinNetwork {
-  id Int @id @default(autoincrement())
-
-  coinCode String
-  coin     Coin   @relation(fields: [coinCode], references: [code], onDelete: Restrict)
-
-  networkId Int
-  network   Network @relation(fields: [networkId], references: [id], onDelete: Restrict)
-
-  depositEnabled  Boolean @default(true)
-  withdrawEnabled Boolean @default(true)
-
-  isDefault Boolean @default(false)
-
-  requiresMemoOverride Boolean?
-
-  tokenContractAddress String?
-  decimals             Int?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([coinCode, networkId])
-  @@index([coinCode])
-  @@index([networkId])
-  @@index([isDefault])
-}
-
-// ===== SETTINGS =====
-
-model Setting {
-  id String @id @default("global")
-
-  feeFloat Decimal @default(0)
-  feeFixed Decimal @default(0)
-  minFee   Decimal @default(0)
-
-  minDeposit Decimal @default(0)
-  maxDeposit Decimal @default(0)
-
-  siteOnline Boolean @default(true)
-
-  updatedAt DateTime @updatedAt
-}
-
 // ===== TRANSACTIONS =====
 
 model Transaction {
   id String @id @default(uuid())
 
-  type   TransactionType?
-  status TransactionStatus
+  status TransactionStatus @default(WAITING_FOR_DEPOSIT)
 
-  depositCoinNetworkId Int?
-  payoutCoinNetworkId  Int
+  depositNetworkId Int?
+  payoutNetworkId  Int
 
-  depositAmount    Decimal
-  depositAmountBtc Decimal
-  payoutAmount     Decimal
-  payoutAmountBtc  Decimal
+  depositNetwork Network? @relation("TxDepositNetwork", fields: [depositNetworkId], references: [id], onDelete: SetNull)
+  payoutNetwork  Network  @relation("TxPayoutNetwork",  fields: [payoutNetworkId],  references: [id], onDelete: Restrict)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  depositAmount Decimal
+  payoutAmount  Decimal
 
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  finishedAt DateTime?
+
+  // Deposit target (generated by script)
   ourDepositAddress      String
-  ourDepositAddressExtra String?
+  ourDepositAddressExtra String? // memo/tag
 
+  // Payout target
   recipientAddress      String
   recipientAddressExtra String?
 
-  refundAddress String?
+  // Blockchain tracking
+  depositTxHash String?
+  payoutTxHash  String?
 
-  isPartner    Boolean
-  partnerEmail String?
-
-  partnerUserId Int?
-  partnerUser   User? @relation("TransactionPartnerUser", fields: [partnerUserId], references: [id])
-
-  finishedAt      DateTime?
-  profitBtc       Decimal?
-  profitRate      Decimal?
-  partnerShare    Decimal?
-  depositTxHash   String?
-  payoutTxHash    String?
-  finalSentAmount Decimal?
-
-  // snapshot полезных полей сети на момент создания tx (чтобы изменения в Network не ломали историю)
-  tatumLedger              String?
-  tatumV3Path              String?
-  tatumChain               String?
-  depositAddressStrategy   DepositAddressStrategy?
-
-  // HD: индекс деривации
+  // Snapshot (critical for history safety)
+  tatumLedger            String?
+  tatumV3Path            String?
+  tatumChain             String?
+  depositAddressStrategy DepositAddressStrategy?
   depositDerivationIndex Int?
-
-  // SHARED_ADDR_WITH_TAG: tag/memo/paymentId
-  depositTag String?
+  depositTag             String?
 
   @@index([status, createdAt])
-  @@index([isPartner, createdAt])
-  @@index([partnerUserId, createdAt])
-  @@index([partnerEmail])
-  @@index([depositCoinNetworkId, payoutCoinNetworkId])
+  @@index([depositNetworkId, payoutNetworkId])
   @@index([finishedAt])
   @@index([depositTxHash])
   @@index([payoutTxHash])
